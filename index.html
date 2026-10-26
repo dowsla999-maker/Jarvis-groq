@@ -99,13 +99,9 @@ a{color:var(--cy)}
   <input type="text" id="name" placeholder="Signore">
 
   <label>Modello</label>
-  <select id="model">
-    <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (consigliato, ottimo italiano)</option>
-    <option value="openai/gpt-oss-120b">openai/gpt-oss-120b (molto intelligente)</option>
-    <option value="openai/gpt-oss-20b">openai/gpt-oss-20b (veloce)</option>
-    <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (leggero, limiti pi&ugrave; larghi)</option>
-  </select>
-  <div class="hint">Se raggiungi il limite, Jarvis passa da solo al modello leggero.</div>
+  <select id="model"></select>
+  <div class="btns" style="margin-top:8px"><button id="refm">Aggiorna elenco modelli</button></div>
+  <div class="hint">L'elenco viene letto da Groq con la tua chiave, quindi contiene solo modelli che puoi usare davvero. Se un modello non risponde o raggiunge il limite, Jarvis ne prova un altro da solo.</div>
 
   <label>Voce del telefono</label>
   <select id="voice"></select>
@@ -136,8 +132,33 @@ a{color:var(--cy)}
 const $=id=>document.getElementById(id);
 const P='jq_';
 const S={get(k,d){try{const v=localStorage.getItem(P+k);return v===null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem(P+k,JSON.stringify(v))}catch(e){}}};
-const FALLBACK='llama-3.1-8b-instant';
-const MODELS=['llama-3.3-70b-versatile','openai/gpt-oss-120b','openai/gpt-oss-20b','llama-3.1-8b-instant'];
+let MODELS=S.get('models',['llama-3.3-70b-versatile','openai/gpt-oss-120b','openai/gpt-oss-20b','llama-3.1-8b-instant']);
+function smallModel(skip){
+  const c=MODELS.filter(m=>m!==skip);
+  return c.find(m=>/instant|8b|20b|mini|small|flash/i.test(m))||c[c.length-1]||MODELS[0];
+}
+function fillModelSelect(){
+  const sel=$('model');sel.innerHTML='';
+  MODELS.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o)});
+  sel.value=MODELS.includes(cfg.model)?cfg.model:MODELS[0];
+}
+async function fetchModels(silent){
+  if(!cfg.key)return false;
+  try{
+    const r=await fetch('https://api.groq.com/openai/v1/models',{headers:{'Authorization':'Bearer '+cfg.key}});
+    if(!r.ok){if(!silent)add('s',r.status===401?'La chiave API non sembra valida.':'Non riesco a leggere l\'elenco dei modelli (errore '+r.status+').');return false}
+    const j=await r.json();
+    let ids=(j.data||[]).map(m=>m.id).filter(id=>id&&!/whisper|tts|orpheus|guard|playai|embed|moderation|safeguard/i.test(id));
+    if(!ids.length)return false;
+    const score=id=>/70b|120b|gpt-oss-120|llama-3\.3|llama-4|qwen/i.test(id)?0:1;
+    ids.sort((a,b)=>score(a)-score(b)||a.localeCompare(b));
+    MODELS=ids;S.set('models',MODELS);
+    if(!MODELS.includes(cfg.model)){cfg.model=MODELS[0];saveAll()}
+    fillModelSelect();
+    if(!silent)add('s','Modelli disponibili per te: '+MODELS.join(', ')+'. Sto usando '+cfg.model+'.');
+    return true;
+  }catch(e){if(!silent)add('s','Non riesco a contattare Groq. Controlla la connessione.');return false}
+}
 const cfg={key:S.get('key',''),model:S.get('model',MODELS[0]),voice:S.get('voice',''),rate:S.get('rate',0.95),pitch:S.get('pitch',0.75),name:S.get('name','Signore'),cont:S.get('cont',false),learnOn:S.get('learnOn',true)};
 let memory=S.get('memory',[]);
 let history=S.get('history',[]);
@@ -250,8 +271,17 @@ async function ask(){
   let model=cfg.model;
   let r=await groq(msgs,model);
   let switched=false;
-  if(!r.ok&&(r.status===429||r.status===404||r.status===400)&&model!==FALLBACK){
-    model=FALLBACK;switched=true;r=await groq(msgs,model);
+  if(!r.ok&&r.status===404&&await fetchModels(true)){
+    model=cfg.model;r=await groq(msgs,model);
+  }
+  if(!r.ok&&(r.status===429||r.status===404||r.status===400)){
+    const tried=[model];
+    const cands=[smallModel(model),...MODELS].filter((m,i,a)=>a.indexOf(m)===i&&m!==model).slice(0,3);
+    for(const m of cands){
+      r=await groq(msgs,m);tried.push(m);
+      if(r.ok){model=m;switched=true;break}
+      if(r.status===401)break;
+    }
   }
   if(!r.ok){
     let msg='';try{msg=(await r.json()).error.message}catch(e){}
@@ -298,7 +328,7 @@ async function learnNow(){
   try{
     const recent=history.slice(-8).map(m=>(m.role==='user'?'Utente: ':'Jarvis: ')+m.content.slice(0,400)).join('\n');
     const prompt='Analizza questa conversazione ed estrai SOLO informazioni stabili e utili sull\'utente: nome, lavoro, famiglia, abitudini, preferenze, progetti, stile di risposta preferito. Ignora dati sensibili (password, codici, numeri di carte, documenti, dati sanitari). Già noto: '+JSON.stringify(learn)+'. Rispondi SOLO con un oggetto JSON di questa forma: {"fatti":["...","..."]} con i NUOVI fatti brevi in italiano, oppure {"fatti":[]} se non c\'è nulla da aggiungere.\n\n'+recent;
-    const r=await groq([{role:'user',content:prompt}],FALLBACK,{temperature:0.1,max_tokens:400,response_format:{type:'json_object'}});
+    const r=await groq([{role:'user',content:prompt}],smallModel(''),{temperature:0.1,max_tokens:400,response_format:{type:'json_object'}});
     if(!r.ok)return;
     const j=await r.json();
     const o=JSON.parse(j.choices[0].message.content);
@@ -374,7 +404,7 @@ function runBoot(){
 /* ---------- IMPOSTAZIONI ---------- */
 function fillSettings(){
   $('key').value=cfg.key;$('name').value=cfg.name;
-  $('model').value=MODELS.includes(cfg.model)?cfg.model:MODELS[0];
+  fillModelSelect();
   $('rate').value=cfg.rate;$('pitch').value=cfg.pitch;$('cont').checked=cfg.cont;$('learnOn').checked=cfg.learnOn;
   $('rv').textContent=cfg.rate;$('pv').textContent=cfg.pitch;
   $('memlist').textContent=memory.length?'Memoria: '+memory.join(' | '):'Memoria vuota. Di\' "ricordati che..." per aggiungere qualcosa.';
@@ -389,7 +419,11 @@ function readSettings(){
   saveAll();updateBars();
 }
 $('gear').onclick=()=>{fillSettings();$('set').classList.add('open')};
-$('close').onclick=()=>{readSettings();$('set').classList.remove('open')};
+$('close').onclick=()=>{
+  const old=cfg.key;readSettings();$('set').classList.remove('open');
+  if(cfg.key&&cfg.key!==old)fetchModels(false);
+};
+$('refm').onclick=async()=>{cfg.key=$('key').value.trim();saveAll();const ok=await fetchModels(false);if(ok)fillModelSelect()};
 $('test').onclick=()=>{readSettings();speak('Buonasera '+cfg.name+'. Tutti i sistemi sono operativi. Come posso esserle utile?')};
 $('clr').onclick=()=>{history=[];saveAll();$('chat').innerHTML='';fillSettings()};
 $('clrm').onclick=()=>{memory=[];saveAll();fillSettings()};
@@ -410,6 +444,7 @@ $('tbat').onclick=()=>{
     fillSettings();$('set').classList.add('open');
   }else{
     add('j',sal+', '+cfg.name+'. Sono a sua disposizione.');
+    fetchModels(true);
   }
   runBoot();
 })();
